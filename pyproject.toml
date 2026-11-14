@@ -13,7 +13,11 @@ dependencies = [
   "numpy",
   "matplotlib",
   "requests",
+  "xarray",
+  "metpy",
+  "plotly",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["meteo_lib*"]
