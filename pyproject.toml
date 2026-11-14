@@ -1,4 +1,3 @@
-# ~/Projects/meteo_lib/meteo_lib/pyproject.toml
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -18,6 +17,6 @@ dependencies = [
   "plotly",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["meteo_lib*"]
+[tool.setuptools]
+packages = ["meteo_lib"]
+package-dir = {"meteo_lib" = "."}
