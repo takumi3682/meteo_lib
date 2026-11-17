@@ -226,11 +226,12 @@ def create_skewt_figure(
         )
         return fig
 
-    # データの抽出と数値への変換
+# データの抽出と数値への変換
+# データの抽出と数値への変換（mask_100 を外して元に戻す）
     p = sounding["p"].to("hPa").magnitude
     T = sounding["T"].to("degC").magnitude
     Td = sounding["Td"].to("degC").magnitude
-    
+
     # 風データの取得 (m/s または knots)
     u = sounding.get("u")
     v = sounding.get("v")
@@ -240,7 +241,7 @@ def create_skewt_figure(
     idx = sounding["indices"]
     parcel = idx.get("parcel_prof")
     parcel_T = parcel.to("degC").magnitude if parcel is not None else None
-
+    
     # 背景線の描画
     _add_background_grids(fig, rotation=rotation)
 
@@ -277,17 +278,43 @@ def create_skewt_figure(
             hoverinfo="skip"
         ))
 
-    # 3. 特徴気圧面（LCL, LFC, EL）の水平線アノテーション
-    for key, color, label_prefix in [("lcl_p", "navy", "LCL"), ("lfc_p", "darkorange", "LFC"), ("el_p", "crimson", "EL")]:
+# 3. 特徴気圧面（LCL, LFC, EL）の水平線とラベル（凡例＋破線上アノテーション）
+    level_styles = [
+        ("lcl_p", "navy", "LCL", "dot"),
+        ("lfc_p", "darkorange", "LFC", "dash"),
+        ("el_p", "crimson", "EL", "dashdot"),
+    ]
+    for key, color, label_prefix, dash_style in level_styles:
         val = idx.get(key)
         if val is not None and not np.isnan(val.magnitude):
-            p_val = val.to("hPa").magnitude
-            fig.add_hline(
-                y=p_val, line_dash="dot", line_color=color, line_width=1.2,
-                annotation_text=f"{label_prefix} ({p_val:.0f} hPa)",
-                annotation_position="bottom right",
-                annotation_font_size=10,
-                annotation_font_color=color
+            p_val = float(val.to("hPa").magnitude)
+            label_text = f"{label_prefix} ({p_val:.0f} hPa)"
+
+            # (1) 水平破線を描画し、右上の凡例（Legend）にもラベルを表示する
+            fig.add_trace(
+                go.Scatter(
+                    x=[-100, 100],
+                    y=[p_val, p_val],
+                    mode="lines",
+                    line=dict(color=color, width=1.2, dash=dash_style),
+                    name=label_text,
+                    showlegend=True,
+                    hovertemplate=f"{label_text}<extra></extra>",
+                )
+            )
+
+            # (2) 破線上の左端付近に直接ラベルを表示（対数軸のため y には np.log10(p_val) を指定）
+            fig.add_annotation(
+                x=0.02,
+                y=np.log10(p_val),
+                xref="paper",
+                yref="y",
+                text=label_text,
+                showarrow=False,
+                xanchor="left",
+                yanchor="bottom",
+                font=dict(size=10, color=color),
+                bgcolor="rgba(255, 255, 255, 0.7)",
             )
 
     # rotation に応じた X軸範囲と風羽位置の自動調整
@@ -345,7 +372,8 @@ def create_skewt_figure(
         yaxis=dict(
             title="Pressure (hPa)",
             type="log",
-            autorange="reversed",
+#            autorange="reversed",
+            range=[np.log10(1050), np.log10(100)],
             tickvals=[1000, 850, 700, 500, 400, 300, 250, 200, 150, 100],
             ticktext=["1000", "850", "700", "500", "400", "300", "250", "200", "150", "100"],
             gridcolor="rgba(200, 200, 200, 0.2)"
