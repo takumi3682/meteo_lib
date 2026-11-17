@@ -10,21 +10,22 @@ import numpy as np
 import plotly.graph_objects as go
 
 
-def skew_transform(t_val, p_val):
-    """MetPyの45度傾斜角に合わせたスキュード座標変換"""
-    return t_val + 40.0 * np.log(1000.0 / p_val)
+def skew_transform(t_val, p_val, rotation: float = 45):
+    """指定された傾斜角（度）に合わせたスキュード座標変換（45度で係数40.0基準）"""
+    skew_factor = 40.0 * np.tan(np.radians(rotation))
+    return t_val + skew_factor * np.log(1000.0 / p_val)
 
 
-def _add_background_grids(fig: go.Figure):
+def _add_background_grids(fig: go.Figure, rotation: float = 45):
     """MetPy標準に忠実な背景グリッド線（等温線、0℃破線、乾燥断熱線、湿潤断熱線）を描画"""
     p_grid = np.linspace(1050, 100, 120)
 
-    # 1. 等温線 (45度傾斜)
+    # 1. 等温線 (rotation度傾斜)
     for t_val in range(-80, 51, 10):
         t_arr = np.full_like(p_grid, t_val, dtype=float)
         if t_val == 0:
             fig.add_trace(go.Scatter(
-                x=skew_transform(t_arr, p_grid),
+                x=skew_transform(t_arr, p_grid, rotation),
                 y=p_grid,
                 mode="lines",
                 line=dict(color="cyan", width=1.5, dash="dash"),
@@ -33,7 +34,7 @@ def _add_background_grids(fig: go.Figure):
             ))
         else:
             fig.add_trace(go.Scatter(
-                x=skew_transform(t_arr, p_grid),
+                x=skew_transform(t_arr, p_grid, rotation),
                 y=p_grid,
                 mode="lines",
                 line=dict(color="rgba(180, 180, 180, 0.4)", width=1),
@@ -47,7 +48,7 @@ def _add_background_grids(fig: go.Figure):
         theta_k = theta + 273.15
         t_c = theta_k * (p_grid / 1000.0) ** kappa - 273.15
         fig.add_trace(go.Scatter(
-            x=skew_transform(t_c, p_grid),
+            x=skew_transform(t_c, p_grid, rotation),
             y=p_grid,
             mode="lines",
             line=dict(color="rgba(165, 42, 42, 0.25)", width=1, dash="dash"),
@@ -73,7 +74,7 @@ def _add_background_grids(fig: go.Figure):
             t_curr += dtdp * dp
 
         fig.add_trace(go.Scatter(
-            x=skew_transform(np.array(t_prof), p_grid),
+            x=skew_transform(np.array(t_prof), p_grid, rotation),
             y=p_grid,
             mode="lines",
             line=dict(color="rgba(34, 139, 34, 0.35)", width=1, dash="dot"),
@@ -208,7 +209,11 @@ def _add_wind_barbs(fig: go.Figure, p_arr, u_arr, v_arr, x_barb=41.5):
         ))
 
 
-def create_skewt_figure(sounding: Optional[Dict[str, Any]], title_info: str = "") -> go.Figure:
+def create_skewt_figure(
+    sounding: Optional[Dict[str, Any]],
+    title_info: str = "",
+    rotation: float = 45
+) -> go.Figure:
     """sounding_utils.get_sounding() のプロファイル辞書を受け取り Plotly Figure を返す"""
     fig = go.Figure()
 
@@ -237,11 +242,11 @@ def create_skewt_figure(sounding: Optional[Dict[str, Any]], title_info: str = ""
     parcel_T = parcel.to("degC").magnitude if parcel is not None else None
 
     # 背景線の描画
-    _add_background_grids(fig)
+    _add_background_grids(fig, rotation=rotation)
 
     # 1. 状態曲線のプロット
     fig.add_trace(go.Scatter(
-        x=skew_transform(T, p),
+        x=skew_transform(T, p, rotation),
         y=p,
         mode="lines",
         name="Temperature (T)",
@@ -251,7 +256,7 @@ def create_skewt_figure(sounding: Optional[Dict[str, Any]], title_info: str = ""
     ))
 
     fig.add_trace(go.Scatter(
-        x=skew_transform(Td, p),
+        x=skew_transform(Td, p, rotation),
         y=p,
         mode="lines",
         name="Dewpoint (Td)",
@@ -264,7 +269,7 @@ def create_skewt_figure(sounding: Optional[Dict[str, Any]], title_info: str = ""
     if parcel_T is not None:
         p_valid = sounding["p_valid"].to("hPa").magnitude
         fig.add_trace(go.Scatter(
-            x=skew_transform(parcel_T, p_valid),
+            x=skew_transform(parcel_T, p_valid, rotation),
             y=p_valid,
             mode="lines",
             name="Parcel Profile",
@@ -285,8 +290,16 @@ def create_skewt_figure(sounding: Optional[Dict[str, Any]], title_info: str = ""
                 annotation_font_color=color
             )
 
+    # rotation に応じた X軸範囲と風羽位置の自動調整
+    if rotation == 0:
+        x_range = [-75, 48]   # 上空の -70℃ 付近まで見切れずに表示
+        x_barb = 43.0
+    else:
+        x_range = [-40, 46]   # 従来の Skew-T 用範囲
+        x_barb = 41.5
+
     # 4. 風羽（Wind Barbs）の描画
-    _add_wind_barbs(fig, p, u_mag, v_mag, x_barb=41.5)
+    _add_wind_barbs(fig, p, u_mag, v_mag, x_barb=x_barb)
 
     # 5. 安定度指数テキストボックス
     def fmt(val, unit_str, precision=0):
@@ -319,12 +332,13 @@ def create_skewt_figure(sounding: Optional[Dict[str, Any]], title_info: str = ""
         font=dict(family="monospace", size=11, color="black")
     )
 
-    # 6. レイアウト設定（風羽の領域を確保するため X軸の上限を 46 に設定）
+    # 6. レイアウト設定
     fig.update_layout(
         title=dict(text=f"Interactive Sounding Profile: {title_info}", font=dict(size=14)),
         xaxis=dict(
             title="Temperature (°C)",
-            range=[-40, 46],
+            range=x_range,
+            dtick=10,
             zeroline=False,
             gridcolor="rgba(200, 200, 200, 0.2)"
         ),
@@ -343,3 +357,12 @@ def create_skewt_figure(sounding: Optional[Dict[str, Any]], title_info: str = ""
     )
 
     return fig
+
+
+def plot_sounding(
+    sounding: Optional[Dict[str, Any]],
+    title_info: str = "",
+    rotation: float = 45
+) -> go.Figure:
+    """sounding_utils.plot_sounding と互換性を持たせるためのラッパー関数"""
+    return create_skewt_figure(sounding, title_info=title_info, rotation=rotation)

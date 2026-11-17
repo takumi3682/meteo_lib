@@ -1,53 +1,17 @@
 """
 sounding_utils.py
 =================
-1次元鉛直大気プロファイル（ゾンデ実測、MSM客観解析、ERA5再解析）の取得・抽出、
+1次元鉛直大気プロファイル（ゾンデ実測：NOAA IGRA v2 / 気象庁JMA、MSM客観解析、ERA5再解析）の取得・抽出、
 大気安定度指数（CAPE, CIN, SSI, LI, PWAT等）の計算、および Skew-T Log-P 図描画モジュール。
-
-提供関数一覧
-------------
-1. get_sounding(source="msm", dt=None, lat=None, lon=None, station=None, station_id=None, step_idx=0)
-   - 'msm', 'era5', 'igra' の各データソースから鉛直プロファイルを統合取得するファサード関数。
-   - 地点名（例: "仙台", "館野", "東京"）の指定により緯度経度・観測所IDを自動補完。
-2. plot_sounding(sounding, title_info="")
-   - 抽出したプロファイル辞書を受け取り、Skew-T Log-P 図、状態曲線、風向風速矢羽根、各種安定度指標を描画。
-3. resolve_station_info(station_input)
-   - 地点名・英名・IGRA IDから辞書マスターを照合し {lat, lon, id, name} を解決。
-4. download_rish_msm_p(year, month, day, hour)
-   - 京都大学RISHからMSM気圧面GPV(GRIB2)をダウンロードする下位関数。
-5. extract_msm_sounding(msm_file_path, target_lat, target_lon, step_idx=0)
-   - MSM気圧面GRIB2から特定地点のプロファイルを抽出・計算。
-6. extract_igra_sounding(station_id, dt)
-   - NOAA IGRA v2 実測データから特定日時のプロファイルを抽出・計算。
-7. extract_era5_sounding(nc_file_path, target_lat, target_lon)
-   - ERA5 NetCDFからプロファイルを抽出・計算。
-
-使用例
-------
-from datetime import datetime
-from sounding_utils import get_sounding, plot_sounding
-
-dt = datetime(2026, 8, 13, 12)
-
-# 1. 気象庁 MSM による仙台上空のサウンディング取得と描画
-msm_sd = get_sounding(source="msm", dt=dt, station="仙台")
-plot_sounding(msm_sd, title_info="MSM - Sendai (2026-08-13 12UTC)")
-
-# 2. NOAA IGRA 実測ゾンデ（館野/つくば）の取得と描画
-igra_sd = get_sounding(source="igra", dt=dt, station="館野")
-plot_sounding(igra_sd, title_info="NOAA IGRA - Tateno (2026-08-13 12UTC)")
-
-# 3. 任意の緯度経度での MSM サウンディング取得
-custom_sd = get_sounding(source="msm", dt=dt, lat=35.60, lon=140.10)
 """
 
+from datetime import datetime, timedelta, timezone
 import io
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 import urllib.request
 import zipfile
-import cdsapi
 import matplotlib.pyplot as plt
 import metpy.calc as mpcalc
 from metpy.plots import SkewT
@@ -55,7 +19,7 @@ from metpy.units import units
 import numpy as np
 import pandas as pd
 import xarray as xr
-from datetime import datetime
+import requests
 
 # ==============================================================================
 # 基本ディレクトリ設定（プロジェクトルート基準）
@@ -76,29 +40,29 @@ for d in [MSM_CACHE_DIR, ERA5_CACHE_DIR, IGRA_CACHE_DIR]:
 # ==============================================================================
 STATION_COORDS = {
     # 東北・北海道
-    "札幌": {"id": "JAM00047412", "lat": 43.06, "lon": 141.33, "en": "SAPPORO"},
-    "秋田": {"id": "JAM00047582", "lat": 39.72, "lon": 140.10, "en": "AKITA"},
-    "仙台": {"id": "JAM00047590", "lat": 38.26, "lon": 140.90, "en": "SENDAI"},
+    "札幌": {"id": "JAM00047412", "prec_no": 14, "lat": 43.06, "lon": 141.33, "en": "SAPPORO"},
+    "秋田": {"id": "JAM00047582", "prec_no": 32, "lat": 39.72, "lon": 140.10, "en": "AKITA"},
+    "仙台": {"id": "JAM00047590", "prec_no": 34, "lat": 38.26, "lon": 140.90, "en": "SENDAI"},
     # 関東・中部・北陸
-    "館野": {"id": "JAM00047646", "lat": 36.06, "lon": 140.13, "en": "TATENO"},
-    "つくば": {"id": "JAM00047646", "lat": 36.06, "lon": 140.13, "en": "TATENO"},
-    "東京": {"id": None, "lat": 35.69, "lon": 139.75, "en": "TOKYO"},
-    "千葉": {"id": None, "lat": 35.60, "lon": 140.10, "en": "CHIBA"},
-    "輪島": {"id": "JAM00047600", "lat": 37.39, "lon": 136.90, "en": "WAJIMA"},
-    "名古屋": {"id": None, "lat": 35.18, "lon": 136.90, "en": "NAGOYA"},
+    "館野": {"id": "JAM00047646", "prec_no": 40, "lat": 36.06, "lon": 140.13, "en": "TATENO"},
+    "つくば": {"id": "JAM00047646", "prec_no": 40, "lat": 36.06, "lon": 140.13, "en": "TATENO"},
+    "東京": {"id": None, "prec_no": 44, "lat": 35.69, "lon": 139.75, "en": "TOKYO"},
+    "千葉": {"id": None, "prec_no": 45, "lat": 35.60, "lon": 140.10, "en": "CHIBA"},
+    "輪島": {"id": "JAM00047600", "prec_no": 56, "lat": 37.39, "lon": 136.90, "en": "WAJIMA"},
+    "名古屋": {"id": None, "prec_no": 51, "lat": 35.18, "lon": 136.90, "en": "NAGOYA"},
     # 近畿・西日本
-    "潮岬": {"id": "JAM00047778", "lat": 33.43, "lon": 135.77, "en": "SHIONOMISAKI"},
-    "大阪": {"id": None, "lat": 34.68, "lon": 135.52, "en": "OSAKA"},
-    "福岡": {"id": "JAM00047807", "lat": 33.58, "lon": 130.38, "en": "FUKUOKA"},
-    "鹿児島": {"id": "JAM00047827", "lat": 31.55, "lon": 130.55, "en": "KAGOSHIMA"},
+    "潮岬": {"id": "JAM00047778", "prec_no": 65, "lat": 33.43, "lon": 135.77, "en": "SHIONOMISAKI"},
+    "大阪": {"id": None, "prec_no": 62, "lat": 34.68, "lon": 135.52, "en": "OSAKA"},
+    "福岡": {"id": "JAM00047807", "prec_no": 82, "lat": 33.58, "lon": 130.38, "en": "FUKUOKA"},
+    "鹿児島": {"id": "JAM00047827", "prec_no": 88, "lat": 31.55, "lon": 130.55, "en": "KAGOSHIMA"},
     # 南西諸島・海洋島
-    "八丈島": {"id": "JAM00047678", "lat": 33.12, "lon": 139.78, "en": "HACHIJOJIMA"},
-    "名瀬": {"id": "JAM00047909", "lat": 28.38, "lon": 129.49, "en": "NAZE"},
-    "那覇": {"id": "JAM00047936", "lat": 26.21, "lon": 127.68, "en": "NAHA"},
-    "石垣島": {"id": "JAM00047918", "lat": 24.34, "lon": 124.16, "en": "ISHIGAKIJIMA"},
-    "南大東島": {"id": "JAM00047945", "lat": 25.83, "lon": 131.23, "en": "MINAMIDAITOJIMA"},
-    "父島": {"id": "JAM00047971", "lat": 27.09, "lon": 142.19, "en": "CHICHIJIMA"},
-    "南鳥島": {"id": "JAM00047991", "lat": 24.29, "lon": 153.98, "en": "MINAMITORISHIMA"},
+    "八丈島": {"id": "JAM00047678", "prec_no": 44, "lat": 33.12, "lon": 139.78, "en": "HACHIJOJIMA"},
+    "名瀬": {"id": "JAM00047909", "prec_no": 88, "lat": 28.38, "lon": 129.49, "en": "NAZE"},
+    "那覇": {"id": "JAM00047936", "prec_no": 91, "lat": 26.21, "lon": 127.68, "en": "NAHA"},
+    "石垣島": {"id": "JAM00047918", "prec_no": 91, "lat": 24.34, "lon": 124.16, "en": "ISHIGAKIJIMA"},
+    "南大東島": {"id": "JAM00047945", "prec_no": 91, "lat": 25.83, "lon": 131.23, "en": "MINAMIDAITOJIMA"},
+    "父島": {"id": "JAM00047971", "prec_no": 44, "lat": 27.09, "lon": 142.19, "en": "CHICHIJIMA"},
+    "南鳥島": {"id": "JAM00047991", "prec_no": 44, "lat": 24.29, "lon": 153.98, "en": "MINAMITORISHIMA"},
 }
 
 
@@ -109,13 +73,11 @@ def resolve_station_info(station_input: Any) -> Optional[Dict[str, Any]]:
 
     s = str(station_input).strip()
 
-    # 1. 日本語キーでの完全一致
     if s in STATION_COORDS:
         info = STATION_COORDS[s].copy()
         info["name"] = s
         return info
 
-    # 2. 英名・IDでの検索
     for name, info in STATION_COORDS.items():
         if (
             s.upper() == info["en"].upper()
@@ -127,7 +89,6 @@ def resolve_station_info(station_input: Any) -> Optional[Dict[str, Any]]:
             res["name"] = name
             return res
 
-    # 3. 未登録の独自ID（JAM...形式）が直接渡された場合
     if s.startswith("JAM"):
         return {"id": s, "lat": None, "lon": None, "en": s, "name": s}
 
@@ -162,27 +123,44 @@ NAMES = [
 
 
 # ==============================================================================
-# Layer 1 & 2: NOAA IGRA v2 (実測ゾンデ)
+# Layer 1 & 2: NOAA IGRA v2 (実測ゾンデ・過去アーカイブ)
 # ==============================================================================
 class IGRAMemoryCache:
-    def __init__(self):
+    def __init__(self, max_age_hours: int = 24):
         self.cached_station_id = None
+        self.cached_mtime = 0.0
         self.raw_text = ""
+        self.max_age_sec = max_age_hours * 3600
 
     def load_station(self, station_id: str):
-        if self.cached_station_id == station_id:
-            return
         local_zip = os.path.join(IGRA_CACHE_DIR, f"{station_id}-data.txt.zip")
-        if not os.path.exists(local_zip):
+        need_download = True
+
+        if os.path.exists(local_zip):
+            age = datetime.now().timestamp() - os.path.getmtime(local_zip)
+            if age < self.max_age_sec:
+                need_download = False
+
+        if need_download:
             url = f"https://www.ncei.noaa.gov/pub/data/igra/data/data-por/{station_id}-data.txt.zip"
-            print(f"NOAAからIGRAデータをダウンロード中... ({station_id})")
-            urllib.request.urlretrieve(url, local_zip)
+            print(f"NOAAから最新IGRAデータをダウンロード中... ({station_id})")
+            try:
+                urllib.request.urlretrieve(url, local_zip)
+                self.cached_station_id = None  # メモリキャッシュもリセット
+            except Exception as e:
+                print(f"IGRAダウンロード失敗（既存キャッシュがあれば使用）: {e}")
+                if not os.path.exists(local_zip):
+                    raise
+
+        current_mtime = os.path.getmtime(local_zip)
+        if self.cached_station_id == station_id and self.cached_mtime == current_mtime:
+            return
 
         with zipfile.ZipFile(local_zip) as z:
             fname = z.namelist()[0]
             self.raw_text = z.read(fname).decode("utf-8")
         self.cached_station_id = station_id
-
+        self.cached_mtime = current_mtime
 
 igra_cache = IGRAMemoryCache()
 
@@ -241,8 +219,139 @@ def extract_igra_sounding(station_id: str, dt: Any) -> Optional[Dict[str, Any]]:
     wind_dir = wdir_val * units.degrees
     u, v = mpcalc.wind_components(wind_spd, wind_dir)
 
-    return _calc_sounding_indices(p, T, Td, u, v)
+    res = _calc_sounding_indices(p, T, Td, u, v)
+    if res:
+        res["data_origin"] = "IGRA"
+    return res
 
+
+# ==============================================================================
+# Layer 1 & 2: 気象庁 (JMA) 高層気象データ (リアルタイム・直近補完用)
+# ==============================================================================
+# 16方位（日本語・英語）から角度（度）への変換マップ
+WIND_DIR_MAP = {
+    "北": 360.0, "N": 360.0,
+    "北北東": 22.5, "NNE": 22.5,
+    "北東": 45.0, "NE": 45.0,
+    "東北東": 67.5, "ENE": 67.5,
+    "東": 90.0, "E": 90.0,
+    "東南東": 112.5, "ESE": 112.5,
+    "南東": 135.0, "SE": 135.0,
+    "南南東": 157.5, "SSE": 157.5,
+    "南": 180.0, "S": 180.0,
+    "南南西": 202.5, "SSW": 202.5,
+    "南西": 225.0, "SW": 225.0,
+    "西南西": 247.5, "WSW": 247.5,
+    "西": 270.0, "W": 270.0,
+    "西北西": 292.5, "WNW": 292.5,
+    "北西": 315.0, "NW": 315.0,
+    "北北西": 337.5, "NNW": 337.5,
+    "静穏": 0.0, "CALM": 0.0,
+}
+
+def extract_jma_sounding(station_id: str, dt: Any) -> Optional[Dict[str, Any]]:
+    """気象庁（過去の気象データ検索・高層）から指定日時のプロファイルを抽出・計算"""
+    point = str(station_id)[-5:]
+    prec_no = ""
+    for info in STATION_COORDS.values():
+        if info.get("id") and str(info["id"]).endswith(point):
+            prec_no = info.get("prec_no", "")
+            break
+
+    jst_dt = dt + timedelta(hours=9)
+    y, m, d, h = jst_dt.year, jst_dt.month, jst_dt.day, jst_dt.hour
+
+    url = (
+        f"https://www.data.jma.go.jp/stats/etrn/upper/view/hourly_usp.php?"
+        f"prec_no={prec_no}&block_no={point}&year={y}&month={m}&day={d}&hour={h}&atm=&point={point}&view="
+    )
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    def _clean_str(val) -> str:
+        if pd.isna(val):
+            return ""
+        s = (
+            str(val)
+            .replace(")", "")
+            .replace("]", "")
+            .replace("×", "")
+            .replace("///", "")
+            .replace("MMM", "")
+            .strip()
+        )
+        return "" if s.replace("-", "") == "" else s
+
+    def _to_float(val) -> float:
+        s = _clean_str(val)
+        try:
+            return float(s) if s else np.nan
+        except ValueError:
+            return np.nan
+
+    def _to_wdir(val) -> float:
+        s = _clean_str(val)
+        if not s:
+            return np.nan
+        if s in WIND_DIR_MAP:
+            return WIND_DIR_MAP[s]
+        try:
+            return float(s)
+        except ValueError:
+            return np.nan
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding
+        tables = pd.read_html(io.StringIO(resp.text))
+    except Exception as e:
+        print(f"JMAテーブル取得エラー ({url}): {e}")
+        return None
+
+    records = []
+    # 6列テーブル（t[0]:地上1行, t[1]:指定気圧面25行）の両方から抽出
+    for tb in tables:
+        if tb.shape[1] != 6:
+            continue
+        for _, row in tb.iterrows():
+            raw = list(row.values)
+            press = _to_float(raw[0])
+            if np.isnan(press) or not (10.0 <= press <= 1100.0):
+                continue
+            records.append({
+                "press": press,
+                "temp": _to_float(raw[2]),
+                "rh": _to_float(raw[3]),
+                "wspd": _to_float(raw[4]),
+                "wdir": _to_wdir(raw[5]),
+            })
+
+    if not records:
+        return None
+
+    df = pd.DataFrame(records)
+    df = df.drop_duplicates(subset=["press"], keep="first")
+    df = df.dropna(subset=["press", "temp"]).sort_values("press", ascending=False)
+
+    if len(df) < 5:
+        return None
+
+    p = df["press"].values * units.hPa
+    T = df["temp"].values * units.degC
+    # 上空（300hPa以高など）で湿度が欠損している層でも気温線が途切れないよう補間・下限設定
+    rh_vals = df["rh"].interpolate(limit_direction="both").fillna(5.0).clip(lower=1.0, upper=100.0).values
+    Td = mpcalc.dewpoint_from_relative_humidity(T, rh_vals * units.percent)
+
+    wspd_val = df["wspd"].fillna(0).values
+    wdir_val = df["wdir"].fillna(0).values
+    wind_spd = (wspd_val * units("m/s")).to(units.knots)
+    wind_dir = wdir_val * units.degrees
+    u, v = mpcalc.wind_components(wind_spd, wind_dir)
+
+    res = _calc_sounding_indices(p, T, Td, u, v)
+    if res:
+        res["data_origin"] = "JMA"
+    return res
 
 # ==============================================================================
 # Layer 1 & 2: 気象庁 MSM (京都大学RISH)
@@ -354,6 +463,7 @@ def extract_msm_sounding(
     if res:
         res["lat"] = float(ds_point["latitude"].values)
         res["lon"] = float(ds_point["longitude"].values)
+        res["data_origin"] = "MSM"
     return res
 
 
@@ -364,6 +474,11 @@ def download_era5_sounding_nc(
     year: int, month: int, day: int, hour: int, lat: float, lon: float
 ) -> Optional[str]:
     """ECMWF CDSからERA5気圧面データをNetCDFでダウンロード"""
+    try:
+        import cdsapi
+    except ImportError:
+        raise ImportError("ERA5の取得には 'cdsapi' のインストールが必要です。")
+
     file_name = (
         f"era5_sounding_{year:04d}{month:02d}{day:02d}_{hour:02d}UTC_{lat:.1f}N_{lon:.1f}E.nc"
     )
@@ -448,6 +563,7 @@ def extract_era5_sounding(
     if res:
         res["lat"] = float(ds_point[lat_key].values)
         res["lon"] = float(ds_point[lon_key].values)
+        res["data_origin"] = "ERA5"
     return res
 
 
@@ -546,7 +662,7 @@ def get_sounding(
     step_idx: int = 0,
     **kwargs,
 ) -> Optional[Dict[str, Any]]:
-    """'msm', 'era5', 'igra' を統合取得する窓口関数"""
+    """'msm', 'era5', 'igra' ('obs', 'jma') を統合取得する窓口関数"""
     st_target = station if station is not None else station_id
     st_info = resolve_station_info(st_target) if st_target else None
 
@@ -572,6 +688,7 @@ def get_sounding(
             if sounding and st_info:
                 sounding["station_name"] = st_info["name"]
             return sounding
+        return None
 
     # 2. ECMWF ERA5
     elif src == "era5":
@@ -585,21 +702,36 @@ def get_sounding(
             if sounding and st_info:
                 sounding["station_name"] = st_info["name"]
             return sounding
+        return None
 
-    # 3. NOAA IGRA (実測)
-    elif src == "igra":
+    # 3. 実測ゾンデ (直近7日はJMA優先、それ以前はNOAA IGRA優先＋未反映時JMAフォールバック)
+    elif src in ("igra", "obs", "jma"):
         if not resolved_id:
             raise ValueError(
-                f"指定された地点 '{st_target}' は高層ゾンデ実測（IGRA）に対応していません。"
+                f"指定された地点 '{st_target}' は高層ゾンデ実測に対応していません。"
             )
-        sounding = extract_igra_sounding(resolved_id, dt)
+
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        is_recent = (now_utc - dt) <= timedelta(days=7)
+
+        sounding = None
+        if src == "jma" or is_recent:
+            sounding = extract_jma_sounding(resolved_id, dt)
+            if sounding is None and src != "jma":
+                sounding = extract_igra_sounding(resolved_id, dt)
+        else:
+            sounding = extract_igra_sounding(resolved_id, dt)
+            if sounding is None:
+                sounding = extract_jma_sounding(resolved_id, dt)
+
         if sounding:
             sounding["station_name"] = st_info["name"] if st_info else resolved_id
             sounding["station_id"] = resolved_id
+            sounding.setdefault("data_origin", "IGRA")
         return sounding
 
     else:
-        raise ValueError(f"未対応のデータソース: {source} ('msm', 'era5', 'igra')")
+        raise ValueError(f"未対応のデータソース: {source} ('msm', 'era5', 'igra', 'jma')")
 
 
 # ==============================================================================
@@ -724,50 +856,49 @@ def plot_sounding(sounding: Optional[Dict[str, Any]], title_info: str = "", rota
 
 
 def get_msm_level_plane(dt: datetime, level: int = 850, step_idx: int = 0):
-  """MSM気圧面GPVから指定気圧面（hPa）の2次元水平データを一括取得する関数"""
-  file_path = download_rish_msm_p(dt.year, dt.month, dt.day, dt.hour)
-  if not file_path:
-    return None
+    """MSM気圧面GPVから指定気圧面（hPa）の2次元水平データを一括取得する関数"""
+    file_path = download_rish_msm_p(dt.year, dt.month, dt.day, dt.hour)
+    if not file_path:
+        return None
 
-  # cfgrib によるデータセット結合（shortName を filter_by_keys の中に含める）
-  ds_list = []
-  for var in ["t", "u", "v", "r", "gh"]:
-    try:
-      ds_var = xr.open_dataset(
-          file_path,
-          engine="cfgrib",
-          backend_kwargs={
-              "filter_by_keys": {
-                  "typeOfLevel": "isobaricInhPa",
-                  "shortName": var,
-              }
-          },
-      )
-      ds_list.append(ds_var)
-    except Exception as e:
-      print(f"変数 {var} の読み込みスキップまたはエラー: {e}")
+    ds_list = []
+    for var in ["t", "u", "v", "r", "gh"]:
+        try:
+            ds_var = xr.open_dataset(
+                file_path,
+                engine="cfgrib",
+                backend_kwargs={
+                    "filter_by_keys": {
+                        "typeOfLevel": "isobaricInhPa",
+                        "shortName": var,
+                    }
+                },
+            )
+            ds_list.append(ds_var)
+        except Exception as e:
+            print(f"変数 {var} の読み込みスキップまたはエラー: {e}")
 
-  if not ds_list:
-    return None
+    if not ds_list:
+        return None
 
-  ds = xr.merge(ds_list, join="outer", compat="override")
+    ds = xr.merge(ds_list, join="outer", compat="override")
 
-  if "step" in ds.dims:
-    ds_plane = ds.isel(step=step_idx).sel(isobaricInhPa=level)
-  else:
-    ds_plane = ds.sel(isobaricInhPa=level)
+    if "step" in ds.dims:
+        ds_plane = ds.isel(step=step_idx).sel(isobaricInhPa=level)
+    else:
+        ds_plane = ds.sel(isobaricInhPa=level)
 
-  lons_1d = ds_plane["longitude"].values
-  lats_1d = ds_plane["latitude"].values
-  lons, lats = np.meshgrid(lons_1d, lats_1d)
+    lons_1d = ds_plane["longitude"].values
+    lats_1d = ds_plane["latitude"].values
+    lons, lats = np.meshgrid(lons_1d, lats_1d)
 
-  return {
-      "lons": lons,
-      "lats": lats,
-      "z": ds_plane["gh"].values if "gh" in ds_plane else None,
-      "t": (ds_plane["t"].values * units.kelvin).to("degC").magnitude,
-      "rh": ds_plane["r"].values if "r" in ds_plane else None,
-      "u": ds_plane["u"].values,
-      "v": ds_plane["v"].values,
-      "level": level,
-  }
+    return {
+        "lons": lons,
+        "lats": lats,
+        "z": ds_plane["gh"].values if "gh" in ds_plane else None,
+        "t": (ds_plane["t"].values * units.kelvin).to("degC").magnitude,
+        "rh": ds_plane["r"].values if "r" in ds_plane else None,
+        "u": ds_plane["u"].values,
+        "v": ds_plane["v"].values,
+        "level": level,
+    }
