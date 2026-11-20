@@ -179,3 +179,35 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- PyInstaller ビルド成果物・パッケージ ---
+build/
+dist/
+*.app/
+*.pkg
+*.dmg
+*.zip
+*.tar.gz
+*.spec
+
+# --- 気象GPV・キャッシュ・データファイル ---
+raw_grib/
+cache/
+data/
+outputs/
+*.bin
+*.grib2
+*.idx
+*.nc
+*.parquet
+*.png
+*.jpg
+*.svg
+*.pdf
+
+# --- Python / macOS ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.DS_Store
