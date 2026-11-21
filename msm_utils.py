@@ -352,3 +352,370 @@ def plot_msm_snow_chart(
     plt.show()
     plt.close(fig)
     return None
+
+import datetime as dt
+import os
+from pathlib import Path
+import urllib.error
+import urllib.request
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib as mpl
+import matplotlib.patheffects as path_effects
+import matplotlib.pyplot as plt
+import metpy.calc as mpcalc
+from metpy.units import units
+import numpy as np
+from scipy.ndimage import (
+    gaussian_filter,
+    maximum_filter,
+    minimum_filter,
+    uniform_filter,
+)
+import xarray as xr
+
+from .gsm_utils import get_jma_prec_cmap
+from .surface_utils import CACHE_DIR, RAW_DIR
+
+RISH_MSM_BASE_URL = "http://database.rish.kyoto-u.ac.jp/arch/jmadata/data/gpv/original"
+MSM_CACHE_DIR = os.path.join(CACHE_DIR, "msm")
+os.makedirs(MSM_CACHE_DIR, exist_ok=True)
+
+
+def _get_msm_surface_fh_candidates(fcst_hours: int) -> list[str]:
+    """予報時間(FT)に対応するMSM地上GRIB2ファイルのFHサフィックス候補を返す。"""
+    if fcst_hours <= 15:
+        return ["FH00-15"]
+    elif fcst_hours <= 33:
+        return ["FH18-33"]
+    elif fcst_hours <= 39:
+        # 年代や初期時刻により39hまでと51h/78hまでのファイル名が存在する
+        return ["FH36-39", "FH36-51", "FH36-78"]
+    elif fcst_hours <= 51:
+        return ["FH36-51", "FH36-78"]
+    else:
+        return ["FH36-78"]
+
+
+def fetch_msm_surface_grib2(
+    init_time_utc: dt.datetime,
+    fcst_hours: int,
+    save_dir: Path | str = RAW_DIR,
+    overwrite: bool = False,
+) -> Path:
+    """京大RISHアーカイブから該当FTを含むMSM地上(Lsurf) GRIB2ファイルをダウンロードする。"""
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    y_str = init_time_utc.strftime("%Y")
+    m_str = init_time_utc.strftime("%m")
+    d_str = init_time_utc.strftime("%d")
+    hr_str = init_time_utc.strftime("%H0000")
+    base_url = f"{RISH_MSM_BASE_URL}/{y_str}/{m_str}/{d_str}"
+
+    fh_list = _get_msm_surface_fh_candidates(fcst_hours)
+
+    # キャッシュ（既存ファイル）の確認
+    for fh in fh_list:
+        fname = f"Z__C_RJTD_{y_str}{m_str}{d_str}{hr_str}_MSM_GPV_Rjp_Lsurf_{fh}_grib2.bin"
+        dest_path = save_path / fname
+        if dest_path.exists() and dest_path.stat().st_size > 0 and not overwrite:
+            return dest_path
+
+    # ダウンロード試行
+    for fh in fh_list:
+        fname = f"Z__C_RJTD_{y_str}{m_str}{d_str}{hr_str}_MSM_GPV_Rjp_Lsurf_{fh}_grib2.bin"
+        dest_path = save_path / fname
+        url = f"{base_url}/{fname}"
+        try:
+            urllib.request.urlretrieve(url, dest_path)
+            if dest_path.exists() and dest_path.stat().st_size > 0:
+                return dest_path
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue
+            raise RuntimeError(f"MSM地上データのダウンロードに失敗しました ({e.code}): {url}") from e
+
+    raise FileNotFoundError(
+        f"MSM地上GRIB2ファイルが見つかりません: {init_time_utc:%Y-%m-%d %H}UTC (FT+{fcst_hours}h)"
+    )
+
+
+def get_msm_surface_fields(
+    init_time_utc: dt.datetime,
+    fcst_hours: int,
+    lon_bounds: tuple[float, float] = (120.0, 150.0),
+    lat_bounds: tuple[float, float] = (22.4, 47.6),
+    sigma: float = 1.5,
+    cache_dir: Path | str = MSM_CACHE_DIR,
+    raw_dir: Path | str = RAW_DIR,
+) -> dict[str, np.ndarray | dt.datetime]:
+    """MSM地上データから海面更正気圧(hPa)・10m風(kt)・前1時間降水量(mm)を抽出しNetCDFキャッシュで返す。"""
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    ini_str = init_time_utc.strftime("%Y%m%d%H")
+    ext_str = f"{lon_bounds[0]}_{lon_bounds[1]}_{lat_bounds[0]}_{lat_bounds[1]}"
+    nc_file = cache_path / f"msm_sfc_{ini_str}_ft{fcst_hours:03d}_{ext_str}.nc"
+
+    if nc_file.exists():
+        with xr.open_dataset(nc_file) as ds_cached:
+            prmsl_hpa = ds_cached["prmsl"].values
+            u10_kt = ds_cached["u10"].values
+            v10_kt = ds_cached["v10"].values
+            prcp_1h = ds_cached["prcp_1h"].values
+            lon = ds_cached["longitude"].values
+            lat = ds_cached["latitude"].values
+    else:
+        grib_path = fetch_msm_surface_grib2(init_time_utc, fcst_hours, save_dir=raw_dir)
+        lon_min, lon_max = lon_bounds
+        lat_min, lat_max = lat_bounds
+        target_step = np.timedelta64(fcst_hours, "h")
+
+        # 1. 海面更正気圧・10m風 (instant)
+        with xr.open_dataset(
+            grib_path,
+            engine="cfgrib",
+            backend_kwargs={
+                "filter_by_keys": {"stepType": "instant"},
+                "indexpath": "",
+            },
+        ) as ds_inst:
+            if "step" in ds_inst.dims:
+                ds_inst_step = ds_inst.sel(step=target_step)
+            else:
+                ds_inst_step = ds_inst
+
+            lat_desc = bool(ds_inst_step.latitude[0] > ds_inst_step.latitude[-1])
+            lat_slice = slice(lat_max, lat_min) if lat_desc else slice(lat_min, lat_max)
+            lon_slice = slice(lon_min, lon_max)
+
+            prmsl_var = "prmsl" if "prmsl" in ds_inst_step.data_vars else "msl"
+            prmsl_sub = ds_inst_step[prmsl_var].sel(latitude=lat_slice, longitude=lon_slice)
+            prmsl_hpa = (prmsl_sub.values * units.Pa).to(units.hPa).magnitude
+            lon = prmsl_sub.longitude.values
+            lat = prmsl_sub.latitude.values
+
+            u10_sub = ds_inst_step["u10"].sel(latitude=lat_slice, longitude=lon_slice)
+            v10_sub = ds_inst_step["v10"].sel(latitude=lat_slice, longitude=lon_slice)
+            u10_kt = (u10_sub.values * units("m/s")).to(units.knots).magnitude
+            v10_kt = (v10_sub.values * units("m/s")).to(units.knots).magnitude
+
+        # 2. 前1時間積算降水量 (accum / FT=0の場合はゼロ配列)
+        if fcst_hours == 0:
+            prcp_1h = np.zeros_like(prmsl_hpa)
+        else:
+            with xr.open_dataset(
+                grib_path,
+                engine="cfgrib",
+                backend_kwargs={
+                    "filter_by_keys": {"typeOfLevel": "surface", "stepType": "accum"},
+                    "indexpath": "",
+                },
+            ) as ds_acc:
+                if "step" in ds_acc.dims:
+                    ds_acc_step = ds_acc.sel(step=target_step)
+                else:
+                    ds_acc_step = ds_acc
+
+                tp_var = "tp" if "tp" in ds_acc_step.data_vars else list(ds_acc_step.data_vars.keys())[0]
+                tp_sub = ds_acc_step[tp_var].sel(latitude=lat_slice, longitude=lon_slice)
+                prcp_1h = np.maximum(np.squeeze(tp_sub.values), 0.0)
+
+        ds_out = xr.Dataset(
+            {
+                "prmsl": (["latitude", "longitude"], prmsl_hpa, {"units": "hPa"}),
+                "u10": (["latitude", "longitude"], u10_kt, {"units": "knots"}),
+                "v10": (["latitude", "longitude"], v10_kt, {"units": "knots"}),
+                "prcp_1h": (["latitude", "longitude"], prcp_1h, {"units": "mm"}),
+            },
+            coords={"latitude": lat, "longitude": lon},
+        )
+        ds_out.to_netcdf(nc_file)
+        if not Path("/Users").exists():
+            grib_path.unlink(missing_ok=True)
+
+    if sigma > 0:
+        prmsl_hpa = gaussian_filter(prmsl_hpa, sigma=sigma)
+        u10_kt = gaussian_filter(u10_kt, sigma=sigma)
+        v10_kt = gaussian_filter(v10_kt, sigma=sigma)
+        prcp_1h = gaussian_filter(prcp_1h, sigma=sigma * 0.6)
+
+    wspd_kt = mpcalc.wind_speed(u10_kt * units.knots, v10_kt * units.knots).magnitude
+    valid_dt = init_time_utc + dt.timedelta(hours=fcst_hours)
+
+    return {
+        "lon": lon,
+        "lat": lat,
+        "prmsl": prmsl_hpa,
+        "u10": u10_kt,
+        "v10": v10_kt,
+        "wspd10": wspd_kt,
+        "prcp_1h": prcp_1h,
+        "init_time": init_time_utc,
+        "valid_time": valid_dt,
+    }
+
+
+def plot_msm_surface_chart(
+    dt_str: str,
+    fcst_hours: int = 3,
+    extent: tuple[float, float, float, float] = (122.0, 148.0, 24.0, 46.5),
+    save_path: str | Path | None = None,
+    return_fig: bool = False,
+) -> plt.Figure | None:
+    """MSMデータから地上10m風（流線・矢羽）と地上気圧(2hPa間隔・H/L)＋前1時間降水量の天気図を生成する。"""
+    init_dt = dt.datetime.strptime(dt_str[:10], "%Y%m%d%H")
+    fields = get_msm_surface_fields(init_dt, fcst_hours=fcst_hours, sigma=1.5)
+
+    dtm_ini: dt.datetime = fields["init_time"]
+    dtm_fcst: dt.datetime = fields["valid_time"]
+    lon = fields["lon"]
+    lat = fields["lat"]
+
+    fig = plt.figure(figsize=(210 / 25.4, 294 / 25.4), dpi=150)
+    fig.text(0.10, 0.97, "JMA MSM (5 km) - Surface Wind, MSLP & 1h Precipitation", fontsize=13, fontweight="bold")
+    fig.text(0.10, 0.95, f"Initial : {dtm_ini.strftime('%Y/%m/%d %H')} UTC", fontsize=11)
+    fig.text(0.10, 0.93, f"Forecast: {dtm_fcst.strftime('%Y/%m/%d %H')} UTC (FT+{fcst_hours}h)", fontsize=11)
+
+    # MSM標準のランベルト正角円錐図法
+    lon_center = (extent[0] + extent[1]) / 2.0
+    crs_map = ccrs.LambertConformal(central_longitude=lon_center, central_latitude=35.0, standard_parallels=(30.0, 40.0))
+    crs_data = ccrs.PlateCarree()
+
+    ax01 = fig.add_axes([0.08, 0.51, 0.76, 0.38], projection=crs_map)
+    cb01 = fig.add_axes([0.86, 0.51, 0.015, 0.38])
+    ax02 = fig.add_axes([0.08, 0.05, 0.76, 0.38], projection=crs_map)
+    cb02 = fig.add_axes([0.86, 0.05, 0.015, 0.38])
+
+    # 描画領域の広さに応じて矢羽根の間引き間隔を自動調整（MSMは0.0625度格子）
+    lon_span = extent[1] - extent[0]
+    barb_step = max(6, int(lon_span * 0.75))
+
+    # --------------------------------------------------------------------------
+    # パネル(a): 地上10m風（矢羽根 + 流線）
+    # --------------------------------------------------------------------------
+    ax01.set_title("(a) 10m Surface Wind (Barbs & Streamlines, kt)", loc="left", fontsize=10.5, fontweight="bold", pad=6)
+    ax01.add_feature(cfeature.NaturalEarthFeature("physical", "land", "10m", edgecolor="none", facecolor="green"), alpha=0.08, zorder=1)
+    ax01.add_feature(cfeature.COASTLINE.with_scale("10m"), linewidth=0.6, edgecolor="darkgreen", zorder=5)
+    ax01.add_feature(cfeature.BORDERS.with_scale("10m"), linewidth=0.5, linestyle=":", edgecolor="darkgreen", zorder=5)
+    ax01.set_extent(extent, crs=crs_data)
+
+    clevs_wndsp = np.array([0, 10, 20, 30, 40, 50])
+    norm_wnd = mpl.colors.Normalize(vmin=clevs_wndsp.min(), vmax=clevs_wndsp.max())
+
+    if lat[0] > lat[-1]:
+        lat_asc = lat[::-1]
+        u10_asc = fields["u10"][::-1, :]
+        v10_asc = fields["v10"][::-1, :]
+        wspd_asc = fields["wspd10"][::-1, :]
+    else:
+        lat_asc, u10_asc, v10_asc, wspd_asc = lat, fields["u10"], fields["v10"], fields["wspd10"]
+
+    ax01.barbs(
+        lon[::barb_step], lat_asc[::barb_step], u10_asc[::barb_step, ::barb_step], v10_asc[::barb_step, ::barb_step],
+        length=4.2, transform=crs_data, sizes=dict(emptybarb=0.04), linewidth=0.45, pivot="middle", zorder=3,
+    )
+    st_plot = ax01.streamplot(
+        lon, lat_asc, u10_asc, v10_asc,
+        density=[1.1, 1.1], color=wspd_asc, transform=crs_data,
+        linewidth=1.0, cmap="jet", norm=norm_wnd, zorder=4,
+    )
+    cbar1 = fig.colorbar(st_plot.lines, cax=cb01, ticks=clevs_wndsp, orientation="vertical")
+    cbar1.set_label("10m Wind Speed (kt)", fontsize=9.5)
+    cbar1.ax.tick_params(labelsize=8.5)
+    cbar1.minorticks_off()
+
+    ax01.gridlines(
+        xlocs=np.arange(115, 160, 5), ylocs=np.arange(20, 55, 5),
+        linestyle="dashed", color="green", linewidth=0.4, alpha=0.5,
+    )
+
+    # --------------------------------------------------------------------------
+    # パネル(b): 海面更正気圧(2hPa間隔, H/L) ＋ 前1時間積算降水量
+    # --------------------------------------------------------------------------
+    ax02.set_title("(b) MSLP (2 hPa, H/L) & 1h Accumulated Precipitation (mm)", loc="left", fontsize=10.5, fontweight="bold", pad=6)
+    ax02.add_feature(cfeature.NaturalEarthFeature("physical", "land", "10m", edgecolor="none", facecolor="green"), alpha=0.08, zorder=1)
+    ax02.add_feature(cfeature.COASTLINE.with_scale("10m"), linewidth=0.6, edgecolor="darkgreen", zorder=5)
+    ax02.add_feature(cfeature.BORDERS.with_scale("10m"), linewidth=0.5, linestyle=":", edgecolor="darkgreen", zorder=5)
+    ax02.set_extent(extent, crs=crs_data)
+
+    jmacmap = get_jma_prec_cmap()
+    clevs_prcp = np.array([0.1, 1, 5, 10, 20, 30, 50, 80])
+    norm_prcp = mpl.colors.BoundaryNorm([0.1, 1, 5, 10, 20, 30, 50, 80, 100], 256)
+
+    cf = ax02.contourf(
+        lon, lat, fields["prcp_1h"], levels=clevs_prcp, norm=norm_prcp,
+        cmap=jmacmap, transform=crs_data, extend="max", zorder=2,
+    )
+    ax02.contour(
+        lon, lat, fields["prcp_1h"], levels=[0.1],
+        colors="black", transform=crs_data, linewidths=0.25, linestyles="dashed", zorder=2,
+    )
+    cbar2 = fig.colorbar(cf, cax=cb02, ticks=clevs_prcp, orientation="vertical")
+    cbar2.set_label("1h Precipitation (mm)", fontsize=9.5)
+    cbar2.ax.tick_params(labelsize=8.5)
+    cbar2.minorticks_off()
+
+    # MSM用等圧線 (2hPa間隔、10hPaごとに太線、4hPaごとにラベル)
+    clevs_mslp = np.arange(940, 1062, 2)
+    cs = ax02.contour(
+        lon, lat, fields["prmsl"], levels=clevs_mslp,
+        colors="black", transform=crs_data,
+        linewidths=[1.25, 0.7, 0.7, 0.7, 0.7], zorder=3,
+    )
+    clbls = ax02.clabel(cs, clevs_mslp[::2], fmt="%d", fontsize=8, inline=True)
+    plt.setp(clbls, path_effects=[path_effects.withStroke(linewidth=2, foreground="white")])
+
+    # 高気圧(H)・低気圧(L)の極値検出（MSMは格子間隔が細かいため探索窓を広めに設定）
+    lon_2d, lat_2d = np.meshgrid(lon, lat) if lon.ndim == 1 else (lon, lat)
+    prmsl = fields["prmsl"]
+    win_size = 75
+    local_mean = uniform_filter(prmsl, size=win_size, mode="nearest")
+    is_maxima = (prmsl == maximum_filter(prmsl, size=win_size)) & ((prmsl - local_mean) >= 0.6)
+    is_minima = (prmsl == minimum_filter(prmsl, size=win_size)) & ((local_mean - prmsl) >= 1.0)
+
+    stroke = [path_effects.Stroke(linewidth=2, foreground="white"), path_effects.Normal()]
+
+    def _is_inside_axes(x_lon: float, y_lat: float, margin_axes: float = 0.04) -> bool:
+        proj_pt = ax02.projection.transform_point(x_lon, y_lat, crs_data)
+        axes_pt = ax02.transAxes.inverted().transform(ax02.transData.transform(proj_pt))
+        return (margin_axes <= axes_pt[0] <= 1.0 - margin_axes) and (
+            margin_axes <= axes_pt[1] <= 1.0 - margin_axes
+        )
+
+    for i, j in np.argwhere(is_maxima):
+        if _is_inside_axes(lon_2d[i, j], lat_2d[i, j]):
+            ax02.text(
+                lon_2d[i, j], lat_2d[i, j], "H",
+                transform=crs_data, clip_on=True, color="blue",
+                va="center", ha="center", weight="bold", fontsize=12,
+                path_effects=stroke, zorder=6,
+            )
+
+    for i, j in np.argwhere(is_minima):
+        if _is_inside_axes(lon_2d[i, j], lat_2d[i, j]):
+            ax02.text(
+                lon_2d[i, j], lat_2d[i, j], "L",
+                transform=crs_data, clip_on=True, color="red",
+                va="center", ha="center", weight="bold", fontsize=12,
+                path_effects=stroke, zorder=6,
+            )
+
+    ax02.gridlines(
+        xlocs=np.arange(115, 160, 5), ylocs=np.arange(20, 55, 5),
+        linestyle="dashed", color="green", linewidth=0.4, alpha=0.5,
+    )
+
+    if save_path:
+        out = Path(save_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, transparent=False, bbox_inches="tight")
+
+    if return_fig:
+        return fig
+
+    plt.show()
+    plt.close(fig)
+    return None
