@@ -384,20 +384,18 @@ os.makedirs(MSM_CACHE_DIR, exist_ok=True)
 
 
 def _get_msm_surface_fh_candidates(fcst_hours: int) -> list[str]:
-    """予報時間(FT)に対応するMSM地上GRIB2ファイルのFHサフィックス候補を返す。"""
+    """予報時間(FT)に対応するMSM地上(Lsurf) GRIB2ファイルのFHサフィックス候補を網羅的に返す。"""
     if fcst_hours <= 15:
-        return ["FH00-15"]
+        return ["FH00-15", "FH00-39", "FH00-72", "FH00-78", "FH00-33"]
     elif fcst_hours <= 33:
-        return ["FH18-33"]
+        # RISHの現行アーカイブは FH00-39 / FH00-72 / FH00-78 のいずれかで格納されている
+        return ["FH00-39", "FH00-72", "FH00-78", "FH18-33", "FH16-33", "FH00-33"]
     elif fcst_hours <= 39:
-        # 年代や初期時刻により39hまでと51h/78hまでのファイル名が存在する
-        return ["FH36-39", "FH36-51", "FH36-78"]
+        return ["FH00-39", "FH00-72", "FH00-78", "FH36-39", "FH36-51", "FH36-78"]
     elif fcst_hours <= 51:
-        return ["FH36-51", "FH36-78"]
+        return ["FH00-72", "FH00-78", "FH36-51", "FH36-78"]
     else:
-        return ["FH36-78"]
-
-
+        return ["FH00-72", "FH00-78", "FH36-78"]
 def fetch_msm_surface_grib2(
     init_time_utc: dt.datetime,
     fcst_hours: int,
