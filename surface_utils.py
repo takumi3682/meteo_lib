@@ -241,7 +241,13 @@ def get_msm_surface(
     ds = xr.open_dataset(
         grib_path,
         engine="cfgrib",
-        backend_kwargs={"filter_by_keys": {"stepType": "instant"}},
+        backend_kwargs={
+            "filter_by_keys": {
+                "stepType": "instant",
+                "typeOfLevel": "meanSea",
+                "step": 0,
+            }
+        },
     )
   except Exception as e:
     print(f"GRIB2オープンエラー: {e}")
