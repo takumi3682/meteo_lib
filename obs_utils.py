@@ -62,7 +62,8 @@ SYNOP_STATIONS = {
 
 def fetch_ogimet_synop(target_utc: datetime) -> pd.DataFrame:
     """OGIMETから日本の地上官署SYNOPデータを取得してパースします。"""
-    url = f"https://www.ogimet.com/cgi-bin/getsynop?block=47&begin={target_utc.strftime('%Y%m%d%H')}00&state=Japan"
+    ts_str = target_utc.strftime("%Y%m%d%H")
+    url = f"https://www.ogimet.com/cgi-bin/getsynop?block=47&begin={ts_str}00&end={ts_str}00&state=Japan"
     req = urllib.request.Request(
         url, headers={"User-Agent": "WeatherAnalysis/1.0"}
     )
@@ -87,7 +88,13 @@ def fetch_ogimet_synop(target_utc: datetime) -> pd.DataFrame:
             continue
 
         tokens = raw_synop.split("=")[0].split()
-        if not tokens:
+        if stn_id not in tokens:
+            continue
+
+        # 地点番号 (例: "47590") の位置を基準にする
+        stn_idx = tokens.index(stn_id)
+        body = tokens[stn_idx + 1 :]  # 地点番号より後ろのトークン列
+        if len(body) < 3:
             continue
 
         rec = {
@@ -104,33 +111,83 @@ def fetch_ogimet_synop(target_utc: datetime) -> pd.DataFrame:
             "source": "SYNOP",
         }
 
+        # body[0] は iRiXhVV（スキップ）
+        # body[1] は Nddff（全雲量・風向・風速）
+        nddff = body[1]
+        if len(nddff) == 5:
+            if nddff[0] in "012345678":
+                rec["cloud_cover"] = int(nddff[0])
+            try:
+                wdir = int(nddff[1:3])
+                wspd = int(nddff[3:5])
+                if wdir <= 36 or wdir == 99:
+                    rec["wind_dir_deg"] = 0.0 if wdir == 99 else float(wdir * 10)
+                    rec["wind_spd_kt"] = float(wspd * 1.94384)
+            except ValueError:
+                pass
+
+        # body[2] 以降が 1snTTT(気温), 2snTdTdTd(露点), 3...(現地気圧), 4PPPP(海面気圧)
+        for tok in body[2:]:
+            if tok in ["333", "555"]:
+                break
+            if len(tok) != 5 or not tok[1:].isdigit():
+                continue
+
+            group = tok[0]
+            if group == "1" and tok[1] in "01" and pd.isna(rec["temp_c"]):
+                sign = -1.0 if tok[1] == "1" else 1.0
+                rec["temp_c"] = sign * int(tok[2:5]) / 10.0
+            elif group == "2" and tok[1] in "01" and pd.isna(rec["dewpoint_c"]):
+                sign = -1.0 if tok[1] == "1" else 1.0
+                rec["dewpoint_c"] = sign * int(tok[2:5]) / 10.0
+            elif group == "4" and pd.isna(rec["mslp"]):
+                val = int(tok[1:5]) / 10.0
+                rec["mslp"] = val + 1000.0 if val < 500.0 else val + 900.0
+            elif group == "7" and rec["weather_code"] == 0:
+                rec["weather_code"] = int(tok[1:3])
+
+        # 気温 (1snTTT) の位置を探す（iRiXhVV と Nddff の後ろにあるため index >= 2 から検索）
         t_idx = -1
-        for idx, tok in enumerate(tokens):
+        for idx in range(2, len(tokens)):
+            tok = tokens[idx]
+            if tok in ["333", "555"]:
+                break
             if re.match(r"^1[01]\d{3}$", tok):
                 t_idx = idx
                 sign = -1.0 if tok[1] == "1" else 1.0
                 rec["temp_c"] = sign * int(tok[2:5]) / 10.0
                 break
 
+        # 気温の直前が Nddff (全雲量・風向・風速)
         if t_idx >= 1:
-            for prev_idx in range(t_idx - 1, max(-1, t_idx - 3), -1):
-                tok = tokens[prev_idx]
-                if (
-                    len(tok) == 5
-                    and not tok.startswith("47")
-                    and not tok.startswith("AAXX")
-                ):
-                    if tok[0] in "012345678":
-                        rec["cloud_cover"] = int(tok[0])
-                    try:
-                        wdir = int(tok[1:3])
-                        wspd = int(tok[3:5])
-                        if wdir <= 36:
-                            rec["wind_dir_deg"] = float(wdir * 10)
-                            rec["wind_spd_kt"] = float(wspd * 1.94384)
-                            break
-                    except ValueError:
-                        continue
+            tok = tokens[t_idx - 1]
+            if len(tok) == 5 and tok[0] in "0123456789/":
+                if tok[0] in "012345678":
+                    rec["cloud_cover"] = int(tok[0])
+                try:
+                    wdir = int(tok[1:3])
+                    wspd = int(tok[3:5])
+                    if wdir <= 36 or wdir == 99:
+                        rec["wind_dir_deg"] = 0.0 if wdir == 99 else float(wdir * 10)
+                        rec["wind_spd_kt"] = float(wspd * 1.94384)
+                except ValueError:
+                    pass
+
+        # 気温より後ろのトークンから露点(2)・海面気圧(4)・現在天気(7)を抽出
+        if t_idx != -1:
+            for tok in tokens[t_idx + 1 :]:
+                if tok in ["333", "555"]:
+                    break
+                if len(tok) != 5:
+                    continue
+                if re.match(r"^2[01]\d{3}$", tok) and pd.isna(rec["dewpoint_c"]):
+                    sign = -1.0 if tok[1] == "1" else 1.0
+                    rec["dewpoint_c"] = sign * int(tok[2:5]) / 10.0
+                elif re.match(r"^4\d{4}$", tok) and pd.isna(rec["mslp"]):
+                    val = int(tok[1:5]) / 10.0
+                    rec["mslp"] = val + 1000.0 if val < 500.0 else val + 900.0
+                elif re.match(r"^7\d{4}$", tok) and rec["weather_code"] == 0:
+                    rec["weather_code"] = int(tok[1:3])
 
         for tok in tokens:
             if tok in ["333", "555"]:
@@ -177,8 +234,14 @@ def fetch_iem_metar(target_utc: datetime) -> pd.DataFrame:
     if df.empty or "valid" not in df.columns:
         return pd.DataFrame()
 
-    df["valid"] = pd.to_datetime(df["valid"])
-    df["time_diff"] = (df["valid"] - target_utc).abs()
+    df["valid"] = pd.to_datetime(df["valid"], utc=True)
+    target_ts_utc = (
+        pd.Timestamp(target_utc, tz="UTC")
+        if target_utc.tzinfo is None
+        else pd.Timestamp(target_utc).tz_convert("UTC")
+    )
+    df["time_diff"] = (df["valid"] - target_ts_utc).abs()
+
     df = df.sort_values("time_diff").groupby("station").first().reset_index()
 
     df_out = pd.DataFrame()

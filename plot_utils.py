@@ -648,7 +648,15 @@ def setup_map_axis(extent: list, figsize=(13, 12), dpi=200):
 
 
 def plot_amedas_temp_shade(
-    ax, proj, df_amedas: pd.DataFrame, extent: list, is_regional: bool, sigma=1.2
+    ax,
+    proj,
+    df_amedas: pd.DataFrame,
+    extent: list,
+    is_regional: bool,
+    sigma=1.2,
+    vmin: float = 10.0,
+    vmax: float = 40.0,
+    cmap: str = "coolwarm",
 ):
     """アメダス実況気温からRBF空間補間 + ガウシアン平滑化を行いカラーシェードを描画します。"""
     if df_amedas.empty:
@@ -675,12 +683,15 @@ def plot_amedas_temp_shade(
     if sigma > 0:
         temp_grid = gaussian_filter(temp_grid, sigma=sigma)
 
+    step = 1.0 if is_regional else 2.0
+    levels = np.arange(vmin, vmax + step * 0.5, step)
+
     cs = ax.contourf(
         gx_t,
         gy_t,
         temp_grid,
-        levels=np.arange(10, 40, 1.0 if is_regional else 2.0),
-        cmap="coolwarm",
+        levels=levels,
+        cmap=cmap,
         alpha=0.75,
         transform=proj,
         extend="both",
@@ -823,7 +834,9 @@ def plot_amedas_barbs_and_obs(
                 )
 
 
-def plot_synop_metar_station(ax, proj, sub_obs: pd.DataFrame):
+def plot_synop_metar_station(
+    ax, proj, sub_obs: pd.DataFrame, show_station_name: bool = False
+):
     """METAR / SYNOP の国際式実況 StationPlot を描画します。"""
     if sub_obs.empty:
         return
@@ -843,7 +856,7 @@ def plot_synop_metar_station(ax, proj, sub_obs: pd.DataFrame):
         color="crimson",
         fontweight="bold",
         formatter=lambda v: f"{v:.1f}",
-        bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.6),
+        bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.65),
     )
     stationplot.plot_parameter(
         "SW",
@@ -851,7 +864,7 @@ def plot_synop_metar_station(ax, proj, sub_obs: pd.DataFrame):
         color="forestgreen",
         fontweight="bold",
         formatter=lambda v: f"{v:.1f}",
-        bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.6),
+        bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.65),
     )
 
     press_text = [
@@ -860,7 +873,13 @@ def plot_synop_metar_station(ax, proj, sub_obs: pd.DataFrame):
         else ""
         for p in sub_obs["mslp"]
     ]
-    stationplot.plot_text("NE", press_text, color="black", fontsize=8.0)
+    stationplot.plot_text(
+        "NE",
+        press_text,
+        color="black",
+        fontsize=8.0,
+        bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.65),
+    )
     stationplot.plot_symbol(
         "C",
         sub_obs["cloud_cover"].fillna(0).astype(int).values,
@@ -875,13 +894,14 @@ def plot_synop_metar_station(ax, proj, sub_obs: pd.DataFrame):
         fontsize=10.0,
     )
 
-    station_labels = [
-        f"{row['station']}" + ("(M)" if row["source"] == "METAR" else "(S)")
-        for _, row in sub_obs.iterrows()
-    ]
-    stationplot.plot_text(
-        "SE", station_labels, color="#333333", fontsize=6.5, fontweight="bold"
-    )
+    if show_station_name:
+        station_labels = [
+            f"{row['station']}" + ("(M)" if row["source"] == "METAR" else "(S)")
+            for _, row in sub_obs.iterrows()
+        ]
+        stationplot.plot_text(
+            "SE", station_labels, color="#333333", fontsize=6.5, fontweight="bold"
+        )
 
     w_spd = sub_obs["wind_spd_kt"].fillna(0.0).values * units.knots
     w_dir = sub_obs["wind_dir_deg"].fillna(0.0).values * units.degree
