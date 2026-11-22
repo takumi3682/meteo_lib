@@ -57,7 +57,6 @@ import warnings
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from cartopy.io import DownloadWarning
-import japanize_matplotlib
 import matplotlib.colors as mcolors
 from matplotlib.colors import BoundaryNorm, ListedColormap
 import matplotlib.dates as mdates
@@ -72,6 +71,11 @@ from metpy.plots import StationPlot, current_weather, sky_cover
 from metpy.units import units
 from scipy.interpolate import RBFInterpolator
 from scipy.ndimage import gaussian_filter
+
+try:
+    import japanize_matplotlib
+except ImportError:
+    pass
 
 warnings.filterwarnings("ignore", category=DownloadWarning)
 
