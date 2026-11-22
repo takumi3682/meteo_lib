@@ -37,8 +37,8 @@ def _find_project_root(start: Path) -> Path:
     return start
 
 def _lib_root() -> Path:
-    # meteo_lib リポジトリ（pyproject.tomlがある場所）
-    return Path(__file__).resolve().parents[1]
+    # core_v4.py と同じ階層（meteo_lib/）を返す
+    return Path(__file__).resolve().parent
 
 def _project_root() -> Path:
     """
